@@ -62,6 +62,20 @@ from vllm.utils.mistral import mt as _mt
 logger = init_logger(__name__)
 
 
+def _reused_prompt_token_ids(request: Any) -> list[int] | None:
+    """Pop prompt token ids forwarded for decode-side reuse, if any.
+
+    Backport of vllm main ``renderers/online_renderer.py``. Disaggregated
+    serving carries the prefill stage's ids in ``kv_transfer_params`` so the
+    decode stage can skip re-tokenizing. Removing the key keeps the id list
+    out of the engine's sampling metadata.
+    """
+    kv = getattr(request, "kv_transfer_params", None)
+    if not isinstance(kv, dict):
+        return None
+    return kv.pop("prompt_token_ids", None) or None
+
+
 class OpenAIServingRender:
     def __init__(
         self,
@@ -559,17 +573,28 @@ class OpenAIServingRender:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
-        (conversation,), (engine_input,) = await renderer.render_chat_async(
-            [messages],
-            chat_params,
-            tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
-            skip_mm_cache=skip_mm_cache,
-        )
+        reuse_ids = _reused_prompt_token_ids(request)
+        if reuse_ids:
+            # Decode-side token reuse (backport from vllm main
+            # renderers/online_renderer.py): feed the forwarded ids straight
+            # to the engine, skipping templating and tokenization. messages
+            # are not tokenized, so conversation is empty.
+            conversation = []
+            engine_input = tokens_input(
+                reuse_ids, cache_salt=getattr(request, "cache_salt", None)
+            )
+        else:
+            (conversation,), (engine_input,) = await renderer.render_chat_async(
+                [messages],
+                chat_params,
+                tok_params,
+                prompt_extras={
+                    k: v
+                    for k in ("mm_processor_kwargs", "cache_salt")
+                    if (v := getattr(request, k, None)) is not None
+                },
+                skip_mm_cache=skip_mm_cache,
+            )
 
         if reasoning_parser is not None:
             tokenizer = renderer.get_tokenizer()
